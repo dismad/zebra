@@ -6,7 +6,7 @@
 //!   <https://github.com/zcash/zcash/blob/6fdd9f1b81d3b228326c9826fa10696fc516444b/src/miner.cpp#L865-L880>
 //! - move common code into zebra-chain or zebra-node-services and remove the RPC dependency.
 
-use std::{cmp::min, sync::Arc, thread::available_parallelism, time::Duration};
+use std::{cmp::min, collections::HashSet, sync::Arc, thread::available_parallelism, time::Duration};
 
 use color_eyre::Report;
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -52,6 +52,12 @@ pub const BLOCK_TEMPLATE_REFRESH_LIMIT: Duration = Duration::from_secs(2);
 /// This should be slightly longer than `BLOCK_TEMPLATE_REFRESH_LIMIT` to allow for template
 /// generation.
 pub const BLOCK_MINING_WAIT_TIME: Duration = Duration::from_secs(3);
+
+/// How long to wait before extending a block this process just submitted.
+///
+/// One post-Blossom target spacing. Long enough for a peer tip to replace a
+/// testnet block that lost on work, short enough to resume if the network moved on.
+pub const BLOCK_FORK_ADOPTION_WAIT: Duration = Duration::from_secs(75);
 
 /// Initialize the miner based on its config, and spawn a task for it.
 ///
@@ -401,6 +407,8 @@ where
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
 {
     // Shut down the task when the template sender is dropped, or Zebra shuts down.
+    let mut locally_mined = HashSet::new();
+
     while template_receiver.has_changed().is_ok() && !is_shutting_down() {
         // Get the latest block template, and mark the current value as seen.
         // We mark the value first to avoid missed updates.
@@ -431,6 +439,26 @@ where
         };
 
         let height = template.coinbase_height().expect("template is valid");
+
+        // Do not extend a block this process submitted until getblocktemplate
+        // moves off it. Otherwise a testnet submit that peers never adopt
+        // becomes the next parent, and the miner only extends its own fork.
+        if locally_mined.contains(&template.header.previous_block_hash) {
+            info!(
+                ?height,
+                ?solver_id,
+                parent = ?template.header.previous_block_hash,
+                ?BLOCK_FORK_ADOPTION_WAIT,
+                "template extends a locally submitted block; not mining it"
+            );
+            tokio::select! {
+                changed = template_receiver.changed() => {
+                    changed?;
+                }
+                _ = sleep(BLOCK_FORK_ADOPTION_WAIT) => {}
+            }
+            continue;
+        }
 
         // Set up the cancellation conditions for the miner.
         let mut cancel_receiver = template_receiver.clone();
@@ -486,13 +514,30 @@ where
             continue;
         };
 
-        // Submit the newly mined blocks to the verifiers.
-        //
-        // TODO: if there is a new template (`cancel_fn().is_err()`), and
-        //       GetBlockTemplate.submit_old is false, return immediately, and skip submitting the
-        //       blocks.
+        // submitold is false. A solve whose parent is no longer the template
+        // parent is stale work; committing it is what pins the node to a side chain.
+        let solved_parent = blocks.first().header.previous_block_hash;
+        let template_still_current = template_receiver.cloned_watch_data().is_some_and(|current| {
+            current.header.previous_block_hash == solved_parent
+        });
+        if !template_still_current {
+            info!(
+                ?height,
+                ?solver_id,
+                ?solved_parent,
+                "dropping stale solve; template parent changed"
+            );
+            if template_receiver.has_changed().is_ok() && !is_shutting_down() {
+                sleep(BLOCK_TEMPLATE_REFRESH_LIMIT).await;
+            }
+            continue;
+        }
+
         let mut any_success = false;
         for block in blocks {
+            if block.header.previous_block_hash != solved_parent {
+                continue;
+            }
             let data = block
                 .zcash_serialize_to_vec()
                 .expect("serializing to Vec never fails");
@@ -507,6 +552,7 @@ where
                         "successfully mined a new block",
                     );
                     any_success = true;
+                    locally_mined.insert(block.hash());
                 }
                 Err(error) => info!(
                     ?height,
@@ -529,11 +575,12 @@ where
             continue;
         }
 
-        // Wait for the new block to verify, and the RPC task to pick up a new template.
-        // But don't wait too long, we could have mined on a fork.
+        // Wait out one target spacing so a heavier peer tip can replace this
+        // block before the next template is solved. The loop above will not
+        // extend `locally_mined` parents even if this wait expires.
         tokio::select! {
             shutdown_result = template_receiver.changed() => shutdown_result?,
-            _ = sleep(BLOCK_MINING_WAIT_TIME) => {}
+            _ = sleep(BLOCK_FORK_ADOPTION_WAIT) => {}
 
         }
     }
