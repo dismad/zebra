@@ -407,6 +407,9 @@ where
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
 {
     // Shut down the task when the template sender is dropped, or Zebra shuts down.
+    // Parent of the tip when this solver started. A private fork never moves
+    // off this hash unless we mine, so we do not solve until it changes.
+    let mut startup_tip: Option<block::Hash> = None;
     let mut locally_mined = HashSet::new();
 
     while template_receiver.has_changed().is_ok() && !is_shutting_down() {
@@ -439,6 +442,32 @@ where
         };
 
         let height = template.coinbase_height().expect("template is valid");
+
+        let parent = template.header.previous_block_hash;
+        if startup_tip.is_none() {
+            startup_tip = Some(parent);
+            info!(
+                ?height,
+                ?solver_id,
+                ?parent,
+                "miner latched startup tip; waiting for a parent this process did not start on"
+            );
+        }
+        if startup_tip == Some(parent) {
+            info!(
+                ?height,
+                ?solver_id,
+                ?parent,
+                "template parent is still the startup tip; not mining"
+            );
+            tokio::select! {
+                changed = template_receiver.changed() => {
+                    changed?;
+                }
+                _ = sleep(BLOCK_FORK_ADOPTION_WAIT) => {}
+            }
+            continue;
+        }
 
         // Do not extend a block this process submitted until getblocktemplate
         // moves off it. Otherwise a testnet submit that peers never adopt
